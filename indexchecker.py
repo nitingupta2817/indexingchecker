@@ -276,6 +276,18 @@ if "results" in st.session_state and st.session_state["results"]:
 
     if results:
         df = pd.DataFrame(results)
+        # Ensure every expected column exists even if some rows are partial
+        # error rows (e.g. a failed check only has URL/Verdict/Coverage State)
+        expected_cols = [
+            "URL", "Verdict", "Coverage State", "Indexing State",
+            "Last Crawl Time", "Google Canonical", "User Canonical",
+            "Robots.txt State", "Page Fetch State",
+        ]
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = ""
+        df = df.fillna("")
+
         indexed_df = df[df["Verdict"] == "PASS"].copy()
         not_indexed_df = df[df["Verdict"] != "PASS"].copy()
 
