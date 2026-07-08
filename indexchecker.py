@@ -16,6 +16,7 @@ Install: pip install streamlit google-api-python-client google-auth-httplib2 goo
 
 import os
 import pickle
+import secrets
 import time
 
 import pandas as pd
@@ -60,7 +61,6 @@ def build_flow():
         client_config,
         scopes=SCOPES,
         redirect_uri=get_redirect_uri(),
-        autogenerate_code_verifier=True,
     )
     return flow
 
@@ -92,16 +92,16 @@ def ensure_login():
     if "code" in params:
         try:
             flow = build_flow()
-            # Restore the code_verifier generated when the login link was built —
-            # a fresh Flow object here otherwise has none, causing
-            # "Missing code verifier" since Streamlit reruns the whole script.
-            code_verifier = st.session_state.get("code_verifier")
+            # Recover the code_verifier via the 'state' param instead of session_state:
+            # Streamlit can assign a fresh session on the redirect back (e.g. if the
+            # login link opened a new tab), which would wipe anything stored server-side.
+            # Google echoes 'state' back unmodified, so it survives regardless.
+            code_verifier = params.get("state")
             if code_verifier:
                 flow.code_verifier = code_verifier
             flow.fetch_token(code=params["code"])
             creds = flow.credentials
             st.session_state["creds"] = creds
-            st.session_state.pop("code_verifier", None)
             st.query_params.clear()
             st.rerun()
         except Exception as e:
@@ -110,13 +110,17 @@ def ensure_login():
         return None
     else:
         flow = build_flow()
+        # Generate our own PKCE verifier up front and thread it through as the
+        # 'state' value, so it comes back to us on the redirect regardless of
+        # what happens to server-side session state in between.
+        verifier = secrets.token_urlsafe(64)[:128]
+        flow.code_verifier = verifier
         auth_url, _ = flow.authorization_url(
             access_type="offline",
             include_granted_scopes="true",
             prompt="select_account",
+            state=verifier,
         )
-        # Save the verifier now so we can restore it after the redirect
-        st.session_state["code_verifier"] = flow.code_verifier
         st.link_button("🔑 Login with Google", auth_url, type="primary")
         return None
 
