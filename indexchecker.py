@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -32,35 +32,79 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
-TOKEN_FILE = "token.pickle"
-CREDENTIALS_FILE = "credentials.json"
 
 st.set_page_config(page_title="Google Indexing Checker", page_icon="🔎", layout="wide")
 
 
+def get_redirect_uri():
+    """
+    Must exactly match one of the 'Authorized redirect URIs' on the
+    Web application OAuth client in Google Cloud Console.
+    Set this in .streamlit/secrets.toml as app_url, e.g.:
+        app_url = "https://your-app-name.streamlit.app"
+    """
+    return st.secrets["google_oauth"]["app_url"].rstrip("/") + "/"
+
+
+def build_flow():
+    client_config = {
+        "web": {
+            "client_id": st.secrets["google_oauth"]["client_id"],
+            "client_secret": st.secrets["google_oauth"]["client_secret"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [get_redirect_uri()],
+        }
+    }
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=get_redirect_uri())
+    return flow
+
+
 # ---------- Auth ----------
 def get_credentials():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "rb") as f:
-            creds = pickle.load(f)
+    """
+    Returns valid credentials if logged in, otherwise None.
+    Call ensure_login() first to trigger the redirect flow.
+    """
+    creds = st.session_state.get("creds")
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        st.session_state["creds"] = creds
+    return creds if creds and creds.valid else None
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CREDENTIALS_FILE):
-                raise FileNotFoundError(
-                    f"{CREDENTIALS_FILE} not found. Download it from Google Cloud "
-                    "Console (OAuth client, Desktop app type) and place it in the "
-                    "same folder as this script."
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "wb") as f:
-            pickle.dump(creds, f)
 
-    return creds
+def ensure_login():
+    """
+    Handles the OAuth redirect dance for a hosted (non-local) Streamlit app.
+    - If not logged in: shows a 'Login with Google' link.
+    - If Google just redirected back with ?code=...: exchanges it for credentials.
+    """
+    creds = get_credentials()
+    if creds:
+        return creds
+
+    params = st.query_params
+    if "code" in params:
+        try:
+            flow = build_flow()
+            flow.fetch_token(code=params["code"])
+            creds = flow.credentials
+            st.session_state["creds"] = creds
+            st.query_params.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Login failed: {e}")
+            st.query_params.clear()
+        return None
+    else:
+        flow = build_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="select_account",
+        )
+        st.link_button("🔑 Login with Google", auth_url, type="primary")
+        return None
 
 
 def get_logged_in_email(creds):
@@ -73,10 +117,9 @@ def get_logged_in_email(creds):
 
 
 def logout():
-    if os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
-    for key in ("creds", "logged_in_email"):
+    for key in ("creds", "logged_in_email", "results", "quota_hit"):
         st.session_state.pop(key, None)
+    st.query_params.clear()
 
 
 def inspect_url(service, site_url, inspection_url):
@@ -102,39 +145,43 @@ def inspect_url(service, site_url, inspection_url):
 st.title("🔎 Bulk Google Indexing Checker")
 st.caption("Uses Google's official Search Console URL Inspection API — the real index data, not a guess.")
 
-with st.expander("⚙️ First-time setup checklist (click to expand)"):
+with st.expander("⚙️ Setup checklist (click to expand)"):
     st.markdown(
         """
         1. Create a project at [Google Cloud Console](https://console.cloud.google.com/)
         2. Enable the **Google Search Console API** (APIs & Services → Library)
         3. Configure the **OAuth consent screen / Google Auth Platform** (External, add your login email as a test user)
-        4. Create an **OAuth client ID** (Application type: **Desktop app**), download the JSON
-        5. Rename it to `credentials.json`, place it in the same folder as this script
-        6. Make sure the Google account you log in with has access to the site's Search Console property
+        4. Create an OAuth client ID with **Application type: Web application**
+           (not Desktop app — this app runs on a server, not your machine)
+        5. Under **Authorized redirect URIs**, add your deployed app's URL exactly,
+           e.g. `https://your-app-name.streamlit.app/`
+        6. In Streamlit Cloud → your app → Settings → Secrets, add:
+           ```
+           [google_oauth]
+           client_id = "your-client-id.apps.googleusercontent.com"
+           client_secret = "your-client-secret"
+           app_url = "https://your-app-name.streamlit.app"
+           ```
+        7. Make sure the Google account you log in with has access to the site's Search Console property
         """
     )
 
-# ---------- Account status bar ----------
-if "creds" not in st.session_state:
-    if os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE, "rb") as f:
-                st.session_state["creds"] = pickle.load(f)
-        except Exception:
-            pass
+# ---------- Account status bar / login ----------
+creds = ensure_login()
 
-acc_col1, acc_col2 = st.columns([4, 1])
-with acc_col1:
-    if "creds" in st.session_state and st.session_state["creds"]:
-        if "logged_in_email" not in st.session_state:
-            st.session_state["logged_in_email"] = get_logged_in_email(st.session_state["creds"])
+if creds:
+    if "logged_in_email" not in st.session_state:
+        st.session_state["logged_in_email"] = get_logged_in_email(creds)
+    acc_col1, acc_col2 = st.columns([4, 1])
+    with acc_col1:
         st.success(f"Logged in as: **{st.session_state['logged_in_email']}**")
-    else:
-        st.info("Not logged in yet. You'll be prompted when you run a check.")
-with acc_col2:
-    if st.button("🔓 Logout / switch account"):
-        logout()
-        st.rerun()
+    with acc_col2:
+        if st.button("🔓 Logout / switch account"):
+            logout()
+            st.rerun()
+else:
+    st.warning("Please log in with Google to continue.")
+    st.stop()
 
 st.divider()
 
@@ -171,16 +218,9 @@ run = st.button("🚀 Check indexing status", type="primary", disabled=not urls)
 
 if run:
     try:
-        with st.spinner("Authenticating with Google (a browser window may open)..."):
-            creds = get_credentials()
-            st.session_state["creds"] = creds
-            st.session_state["logged_in_email"] = get_logged_in_email(creds)
         service = build("searchconsole", "v1", credentials=creds)
-    except FileNotFoundError as e:
-        st.error(str(e))
-        st.stop()
     except Exception as e:
-        st.error(f"Authentication failed: {e}")
+        st.error(f"Could not start Search Console service: {e}")
         st.stop()
 
     results = []
