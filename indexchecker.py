@@ -56,7 +56,12 @@ def build_flow():
             "redirect_uris": [get_redirect_uri()],
         }
     }
-    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=get_redirect_uri())
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=get_redirect_uri(),
+        autogenerate_code_verifier=True,
+    )
     return flow
 
 
@@ -87,9 +92,16 @@ def ensure_login():
     if "code" in params:
         try:
             flow = build_flow()
+            # Restore the code_verifier generated when the login link was built —
+            # a fresh Flow object here otherwise has none, causing
+            # "Missing code verifier" since Streamlit reruns the whole script.
+            code_verifier = st.session_state.get("code_verifier")
+            if code_verifier:
+                flow.code_verifier = code_verifier
             flow.fetch_token(code=params["code"])
             creds = flow.credentials
             st.session_state["creds"] = creds
+            st.session_state.pop("code_verifier", None)
             st.query_params.clear()
             st.rerun()
         except Exception as e:
@@ -103,6 +115,8 @@ def ensure_login():
             include_granted_scopes="true",
             prompt="select_account",
         )
+        # Save the verifier now so we can restore it after the redirect
+        st.session_state["code_verifier"] = flow.code_verifier
         st.link_button("🔑 Login with Google", auth_url, type="primary")
         return None
 
